@@ -24,6 +24,8 @@ template <typename P> struct gc_layer_rcu_callback;
 template <typename P>
 class unlocked_tcursor {
   public:
+    typedef node_base<P> node_type;
+    typedef leaf<P> leaf_type;
     typedef typename P::value_type value_type;
     typedef key<typename P::ikey_type> key_type;
     typedef typename P::threadinfo_type threadinfo;
@@ -59,8 +61,27 @@ class unlocked_tcursor {
         : ka_(reinterpret_cast<const char*>(s), len),
           lv_(leafvalue<P>::make_empty()), root_(table.fix_root()) {
     }
+    inline unlocked_tcursor(const node_base<P>* root,
+                            const char* s, int len)
+        : ka_(s, len), lv_(leafvalue<P>::make_empty()), root_(root) {
+    }
+    inline unlocked_tcursor(node_base<P>* root,
+                            const char* s, int len)
+        : ka_(s, len), lv_(leafvalue<P>::make_empty()), root_(root) {
+    }
+    inline unlocked_tcursor(const node_base<P>* root,
+                            const unsigned char* s, int len)
+        : ka_(reinterpret_cast<const char*>(s), len),
+          lv_(leafvalue<P>::make_empty()), root_(root) {
+    }
+    inline unlocked_tcursor(node_base<P>* root,
+                            const unsigned char* s, int len)
+        : ka_(reinterpret_cast<const char*>(s), len),
+          lv_(leafvalue<P>::make_empty()), root_(root) {
+    }
 
     bool find_unlocked(threadinfo& ti);
+    bool find_unlocked_edge(threadinfo& ti);
 
     inline value_type value() const {
         return lv_.value();
@@ -78,6 +99,15 @@ class unlocked_tcursor {
         static_assert(int(nodeversion_type::traits_type::top_stable_bits) >= int(leaf<P>::permuter_type::size_bits), "not enough bits to add size to version");
         return (v_.version_value() << leaf<P>::permuter_type::size_bits) + perm_.size();
     }
+    inline int state() const {
+        return state_;
+    }
+    inline bool is_layer() const {
+        return state_ < 0;
+    }
+    inline node_type* layer_root() const {
+        return lv_.layer();
+    }
 
   private:
     leaf<P>* n_;
@@ -86,6 +116,7 @@ class unlocked_tcursor {
     permuter_type perm_;
     leafvalue<P> lv_;
     const node_base<P>* root_;
+    int state_;
 };
 
 template <typename P>
@@ -154,11 +185,42 @@ class tcursor {
 
     inline bool find_locked(threadinfo& ti);
     inline bool find_insert(threadinfo& ti);
+    // find_locked_edge 会停在当前层的匹配槽位上。
+    // 与 find_locked 不同，如果命中的是 layer 入口，它不会自动下钻到子树，
+    // 而是把调用者留在“父目录边”所在的叶子节点上。
+    inline bool find_locked_edge(threadinfo& ti);
 
     inline void finish(int answer, threadinfo& ti);
+    inline void finish_read() {
+        n_->unlock();
+    }
 
     inline nodeversion_value_type previous_full_version_value() const;
     inline nodeversion_value_type next_full_version_value(int state) const;
+    inline int state() const {
+        return state_;
+    }
+    inline bool is_layer() const {
+        return state_ < 0;
+    }
+    inline node_type* layer_root() const {
+        return n_->lv_[kx_.p].layer();
+    }
+    // create_layer 在当前层为一个不存在的精确 key 主动创建空子树入口。
+    // 这为“空目录也必须真实存在”提供最小的内核原语。
+    inline bool create_layer(node_type*& layer_root, threadinfo& ti);
+    // create_layer_with_meta 是 leaf root special allocation 的第一步：
+    // 新建的 layer root 会额外尾随一份 directory_meta。
+    inline bool create_layer_with_meta(node_type*& layer_root,
+                                       const MasstreeLHM::directory_meta& meta,
+                                       threadinfo& ti);
+    // attach_existing_layer 在当前层插入一个新的 layer edge，但不新建目录子树；
+    // 而是把已有的 subtree root 直接挂到新父目录名下。
+    inline bool attach_existing_layer(node_type* layer_root, threadinfo& ti);
+    // remove_layer_edge 专门删除当前层命中的 layer 槽位。
+    // 与普通 value 删除不同，这条路径由 find_locked_edge() 停在父目录边上，
+    // 再显式调用 finish_remove() 进入 Masstree 原生的叶子删除/层压缩链。
+    inline bool remove_layer_edge(threadinfo& ti);
 
   private:
     leaf_type* n_;

@@ -15,6 +15,7 @@
  */
 #ifndef MASSTREE_STRUCT_HH
 #define MASSTREE_STRUCT_HH
+#include "directory_meta.hh"
 #include "masstree.hh"
 #include "nodeversion.hh"
 #include "stringbag.hh"
@@ -87,6 +88,12 @@ class node_base : public make_nodeversion<P>::type {
 
     inline leaf_type* reach_leaf(const key_type& k, nodeversion_type& version,
                                  threadinfo& ti) const;
+    // 只有目录 root 的特殊分配路径才会带这块尾随元数据。
+    // 当前阶段先在 leaf root 上落地，internode root 下一步再补齐。
+    inline bool has_directory_meta() const;
+    inline MasstreeLHM::directory_meta* directory_meta();
+    inline const MasstreeLHM::directory_meta* directory_meta() const;
+    inline size_t allocated_size() const;
 
     void prefetch_full() const {
         for (int i = 0; i < std::min(16 * std::min(P::leaf_width, P::internode_width) + 1, 4 * 64); i += 64)
@@ -106,6 +113,7 @@ class internode : public node_base<P> {
     typedef typename key_bound<width, P::bound_method>::type bound_type;
     typedef typename P::threadinfo_type threadinfo;
 
+    int8_t root_meta_extra64_;
     uint8_t nkeys_;
     uint32_t height_;
     ikey_type ikey0_[width];
@@ -113,18 +121,77 @@ class internode : public node_base<P> {
     node_base<P>* parent_;
     kvtimestamp_t created_at_[P::debug_level > 0];
 
-    internode(uint32_t height)
+    internode(uint32_t height, size_t total_sz)
         : node_base<P>(false), nkeys_(0), height_(height), parent_() {
+        masstree_precondition(total_sz % 64 == 0 && total_sz / 64 < 128);
+        root_meta_extra64_ = (int(total_sz) >> 6) - ((int(sizeof(*this)) + 63) >> 6);
     }
 
     static internode<P>* make(uint32_t height, threadinfo& ti) {
-        void* ptr = ti.pool_allocate(sizeof(internode<P>),
+        size_t sz = (sizeof(internode<P>) + 63) & ~size_t(63);
+        void* ptr = ti.pool_allocate(sz,
                                      memtag_masstree_internode);
-        internode<P>* n = new(ptr) internode<P>(height);
+        internode<P>* n = new(ptr) internode<P>(height, sz);
         assert(n);
         if (P::debug_level > 0)
             n->created_at_[0] = ti.operation_timestamp();
         return n;
+    }
+    static internode<P>* make_root_with_meta(uint32_t height,
+                                             const MasstreeLHM::directory_meta& meta,
+                                             threadinfo& ti) {
+        size_t base_sz = (sizeof(internode<P>) + 63) & ~size_t(63);
+        size_t total_sz = iceil(base_sz + sizeof(MasstreeLHM::directory_meta), 64);
+        void* ptr = ti.pool_allocate(total_sz, memtag_masstree_internode);
+        internode<P>* n = new(ptr) internode<P>(height, total_sz);
+        assert(n);
+        if (P::debug_level > 0)
+            n->created_at_[0] = ti.operation_timestamp();
+        n->make_layer_root();
+        *n->directory_meta() = meta;
+        return n;
+    }
+    // 将一个唯一 child internode 复制成新的带目录元数据的 root。
+    // 这条路径给 gc_layer() 收缩“root internode -> internode child root”使用。
+    static internode<P>* clone_root_with_meta(const internode<P>* src,
+                                              const MasstreeLHM::directory_meta& meta,
+                                              threadinfo& ti) {
+        internode<P>* n = make_root_with_meta(src->height_, meta, ti);
+        n->nkeys_ = src->nkeys_;
+        n->child_[0] = src->child_[0];
+        if (n->child_[0]) {
+            n->child_[0]->set_parent(n);
+        }
+        for (int i = 0; i != src->nkeys_; ++i) {
+            n->assign(i, src->ikey0_[i], src->child_[i + 1]);
+        }
+        return n;
+    }
+
+    size_t allocated_size() const {
+        int es = (root_meta_extra64_ >= 0 ? root_meta_extra64_ : -root_meta_extra64_ - 1);
+        return (sizeof(*this) + es * 64 + 63) & ~size_t(63);
+    }
+
+    bool has_directory_meta() const {
+        return root_meta_extra64_ > 0;
+    }
+
+    MasstreeLHM::directory_meta* directory_meta() {
+        if (!has_directory_meta()) {
+            return nullptr;
+        }
+        return reinterpret_cast<MasstreeLHM::directory_meta*>(
+            reinterpret_cast<char*>(this) + allocated_size() - sizeof(MasstreeLHM::directory_meta));
+    }
+
+    const MasstreeLHM::directory_meta* directory_meta() const {
+        if (!has_directory_meta()) {
+            return nullptr;
+        }
+        return reinterpret_cast<const MasstreeLHM::directory_meta*>(
+            reinterpret_cast<const char*>(this) + allocated_size()
+            - sizeof(MasstreeLHM::directory_meta));
     }
 
     int size() const {
@@ -154,10 +221,10 @@ class internode : public node_base<P> {
     void print(FILE* f, const char* prefix, int depth, int kdepth) const;
 
     void deallocate(threadinfo& ti) {
-        ti.pool_deallocate(this, sizeof(*this), memtag_masstree_internode);
+        ti.pool_deallocate(this, allocated_size(), memtag_masstree_internode);
     }
     void deallocate_rcu(threadinfo& ti) {
-        ti.pool_deallocate_rcu(this, sizeof(*this), memtag_masstree_internode);
+        ti.pool_deallocate_rcu(this, allocated_size(), memtag_masstree_internode);
     }
 
   private:
@@ -266,6 +333,7 @@ class leaf : public node_base<P> {
     };
 
     int8_t extrasize64_;
+    int8_t root_meta_extra64_;
     uint8_t modstate_;
     uint8_t keylenx_[width];
     typename permuter_type::storage_type permutation_;
@@ -282,14 +350,17 @@ class leaf : public node_base<P> {
     kvtimestamp_t created_at_[P::debug_level > 0];
     internal_ksuf_type iksuf_[0];
 
-    leaf(size_t sz, phantom_epoch_type phantom_epoch)
+    leaf(size_t internal_sz, size_t total_sz, phantom_epoch_type phantom_epoch)
         : node_base<P>(true), modstate_(modstate_insert),
           permutation_(permuter_type::make_empty()),
           ksuf_(), parent_(), iksuf_{} {
-        masstree_precondition(sz % 64 == 0 && sz / 64 < 128);
-        extrasize64_ = (int(sz) >> 6) - ((int(sizeof(*this)) + 63) >> 6);
+        masstree_precondition(internal_sz % 64 == 0 && total_sz % 64 == 0);
+        masstree_precondition(internal_sz <= total_sz);
+        masstree_precondition(total_sz / 64 < 128);
+        extrasize64_ = (int(internal_sz) >> 6) - ((int(sizeof(*this)) + 63) >> 6);
+        root_meta_extra64_ = (int(total_sz) >> 6) - (int(internal_sz) >> 6);
         if (extrasize64_ > 0) {
-            new((void*) &iksuf_[0]) internal_ksuf_type(width, sz - sizeof(*this));
+            new((void*) &iksuf_[0]) internal_ksuf_type(width, internal_sz - sizeof(*this));
         }
         if (P::need_phantom_epoch) {
             phantom_epoch_[0] = phantom_epoch;
@@ -299,7 +370,7 @@ class leaf : public node_base<P> {
     static leaf<P>* make(int ksufsize, phantom_epoch_type phantom_epoch, threadinfo& ti) {
         size_t sz = iceil(sizeof(leaf<P>) + std::min(ksufsize, 128), 64);
         void* ptr = ti.pool_allocate(sz, memtag_masstree_leaf);
-        leaf<P>* n = new(ptr) leaf<P>(sz, phantom_epoch);
+        leaf<P>* n = new(ptr) leaf<P>(sz, sz, phantom_epoch);
         assert(n);
         if (P::debug_level > 0) {
             n->created_at_[0] = ti.operation_timestamp();
@@ -313,13 +384,81 @@ class leaf : public node_base<P> {
         n->make_layer_root();
         return n;
     }
+    // 仅目录 leaf root 走这条分配路径：节点本体保持 leaf 语义，
+    // 但在分配块尾部额外尾随一份 directory_meta。
+    static leaf<P>* make_root_with_meta(int ksufsize, leaf<P>* parent,
+                                        const MasstreeLHM::directory_meta& meta,
+                                        threadinfo& ti) {
+        size_t internal_sz = iceil(sizeof(leaf<P>) + std::min(ksufsize, 128), 64);
+        size_t total_sz = iceil(internal_sz + sizeof(MasstreeLHM::directory_meta), 64);
+        void* ptr = ti.pool_allocate(total_sz, memtag_masstree_leaf);
+        leaf<P>* n = new(ptr) leaf<P>(internal_sz, total_sz,
+                                      parent ? parent->phantom_epoch() : phantom_epoch_type());
+        assert(n);
+        if (P::debug_level > 0) {
+            n->created_at_[0] = ti.operation_timestamp();
+        }
+        n->next_.ptr = n->prev_ = 0;
+        n->ikey0_[0] = 0;
+        n->make_layer_root();
+        *n->directory_meta() = meta;
+        return n;
+    }
+    // 将一个唯一 child leaf 复制成新的带目录元数据的 root。
+    // 这条路径专门给 gc_layer() 收缩“冗余 root internode”使用：
+    // old internode root 被回收前，目录 meta 需要落到真正被提升的新 root 上。
+    static leaf<P>* clone_root_with_meta(const leaf<P>* src,
+                                         const MasstreeLHM::directory_meta& meta,
+                                         threadinfo& ti) {
+        size_t internal_sz = src->allocated_size() - src->root_meta_extra64_ * 64;
+        size_t total_sz = iceil(internal_sz + sizeof(MasstreeLHM::directory_meta), 64);
+        void* ptr = ti.pool_allocate(total_sz, memtag_masstree_leaf);
+        leaf<P>* n = new(ptr) leaf<P>(internal_sz, total_sz, src->phantom_epoch());
+        assert(n);
+        if (P::debug_level > 0) {
+            n->created_at_[0] = ti.operation_timestamp();
+        }
+
+        n->next_.ptr = src->next_.ptr;
+        n->prev_ = src->prev_;
+        n->modstate_ = src->modstate_;
+        n->permutation_ = src->permutation_;
+        n->make_layer_root();
+
+        permuter_type perm(src->permutation_);
+        for (int i = 0; i != perm.size(); ++i) {
+            int p = perm[i];
+            n->assign_initialize(p, const_cast<leaf<P>*>(src), p, ti);
+        }
+
+        *n->directory_meta() = meta;
+        return n;
+    }
 
     static size_t min_allocated_size() {
         return (sizeof(leaf<P>) + 63) & ~size_t(63);
     }
     size_t allocated_size() const {
         int es = (extrasize64_ >= 0 ? extrasize64_ : -extrasize64_ - 1);
+        es += root_meta_extra64_;
         return (sizeof(*this) + es * 64 + 63) & ~size_t(63);
+    }
+    bool has_directory_meta() const {
+        return root_meta_extra64_ > 0;
+    }
+    MasstreeLHM::directory_meta* directory_meta() {
+        if (!has_directory_meta()) {
+            return nullptr;
+        }
+        return reinterpret_cast<MasstreeLHM::directory_meta*>(
+            reinterpret_cast<char*>(this) + allocated_size() - sizeof(MasstreeLHM::directory_meta));
+    }
+    const MasstreeLHM::directory_meta* directory_meta() const {
+        if (!has_directory_meta()) {
+            return nullptr;
+        }
+        return reinterpret_cast<const MasstreeLHM::directory_meta*>(
+            reinterpret_cast<const char*>(this) + allocated_size() - sizeof(MasstreeLHM::directory_meta));
     }
     phantom_epoch_type phantom_epoch() const {
         return P::need_phantom_epoch ? phantom_epoch_[0] : phantom_epoch_type();
@@ -542,6 +681,42 @@ template <typename P>
 void basic_table<P>::initialize(threadinfo& ti) {
     masstree_precondition(!root_);
     root_ = node_type::leaf_type::make_root(0, 0, ti);
+}
+
+template <typename P>
+inline bool node_base<P>::has_directory_meta() const {
+    if (this->isleaf()) {
+        return static_cast<const leaf_type*>(this)->has_directory_meta();
+    } else {
+        return static_cast<const internode_type*>(this)->has_directory_meta();
+    }
+}
+
+template <typename P>
+inline MasstreeLHM::directory_meta* node_base<P>::directory_meta() {
+    if (this->isleaf()) {
+        return static_cast<leaf_type*>(this)->directory_meta();
+    } else {
+        return static_cast<internode_type*>(this)->directory_meta();
+    }
+}
+
+template <typename P>
+inline const MasstreeLHM::directory_meta* node_base<P>::directory_meta() const {
+    if (this->isleaf()) {
+        return static_cast<const leaf_type*>(this)->directory_meta();
+    } else {
+        return static_cast<const internode_type*>(this)->directory_meta();
+    }
+}
+
+template <typename P>
+inline size_t node_base<P>::allocated_size() const {
+    if (this->isleaf()) {
+        return static_cast<const leaf_type*>(this)->allocated_size();
+    } else {
+        return static_cast<const internode_type*>(this)->allocated_size();
+    }
 }
 
 

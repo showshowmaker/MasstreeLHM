@@ -59,6 +59,162 @@ bool tcursor<P>::find_insert(threadinfo& ti)
 }
 
 template <typename P>
+bool tcursor<P>::create_layer(node_type*& layer_root, threadinfo& ti) {
+    find_locked_edge(ti);
+    original_n_ = n_;
+    original_v_ = n_->full_unlocked_version_value();
+
+    if (state_) {
+        layer_root = state_ < 0 ? n_->lv_[kx_.p].layer() : nullptr;
+        updated_v_ = n_->full_unlocked_version_value();
+        n_->unlock();
+        return false;
+    }
+
+    state_ = 2;
+    if (unlikely(n_->modstate_ != leaf<P>::modstate_insert)) {
+        masstree_invariant(n_->modstate_ == leaf<P>::modstate_remove);
+        n_->mark_insert();
+        n_->modstate_ = leaf<P>::modstate_insert;
+    }
+
+    if (n_->size() < n_->width) {
+        kx_.p = permuter_type(n_->permutation_).back();
+        if (likely(kx_.p != 0) || !n_->prev_ || n_->ikey_bound() == ka_.ikey()) {
+            n_->assign(kx_.p, ka_, ti);
+        } else {
+            if (make_split(ti)) {
+                n_->unlock();
+                layer_root = nullptr;
+                return false;
+            }
+        }
+    } else {
+        if (make_split(ti)) {
+            n_->unlock();
+            layer_root = nullptr;
+            return false;
+        }
+    }
+
+    leaf_type* nl = leaf_type::make_root(0, n_, ti);
+    n_->lv_[kx_.p] = nl;
+    n_->keylenx_[kx_.p] = n_->layer_keylenx;
+    layer_root = nl;
+    fence();
+    finish_insert();
+    if (n_ == original_n_)
+        updated_v_ = n_->full_unlocked_version_value();
+    else
+        new_nodes_.emplace_back(n_, n_->full_unlocked_version_value());
+    n_->unlock();
+    return true;
+}
+
+template <typename P>
+bool tcursor<P>::create_layer_with_meta(node_type*& layer_root,
+                                        const MasstreeLHM::directory_meta& meta,
+                                        threadinfo& ti) {
+    find_locked_edge(ti);
+    original_n_ = n_;
+    original_v_ = n_->full_unlocked_version_value();
+
+    if (state_) {
+        layer_root = state_ < 0 ? n_->lv_[kx_.p].layer() : nullptr;
+        updated_v_ = n_->full_unlocked_version_value();
+        n_->unlock();
+        return false;
+    }
+
+    state_ = 2;
+    if (unlikely(n_->modstate_ != leaf<P>::modstate_insert)) {
+        masstree_invariant(n_->modstate_ == leaf<P>::modstate_remove);
+        n_->mark_insert();
+        n_->modstate_ = leaf<P>::modstate_insert;
+    }
+
+    if (n_->size() < n_->width) {
+        kx_.p = permuter_type(n_->permutation_).back();
+        if (likely(kx_.p != 0) || !n_->prev_ || n_->ikey_bound() == ka_.ikey()) {
+            n_->assign(kx_.p, ka_, ti);
+        } else {
+            if (make_split(ti)) {
+                n_->unlock();
+                layer_root = nullptr;
+                return false;
+            }
+        }
+    } else {
+        if (make_split(ti)) {
+            n_->unlock();
+            layer_root = nullptr;
+            return false;
+        }
+    }
+
+    leaf_type* nl = leaf_type::make_root_with_meta(0, n_, meta, ti);
+    n_->lv_[kx_.p] = nl;
+    n_->keylenx_[kx_.p] = n_->layer_keylenx;
+    layer_root = nl;
+    fence();
+    finish_insert();
+    if (n_ == original_n_)
+        updated_v_ = n_->full_unlocked_version_value();
+    else
+        new_nodes_.emplace_back(n_, n_->full_unlocked_version_value());
+    n_->unlock();
+    return true;
+}
+
+template <typename P>
+bool tcursor<P>::attach_existing_layer(node_type* layer_root, threadinfo& ti) {
+    find_locked_edge(ti);
+    original_n_ = n_;
+    original_v_ = n_->full_unlocked_version_value();
+
+    if (state_) {
+        updated_v_ = n_->full_unlocked_version_value();
+        n_->unlock();
+        return false;
+    }
+
+    state_ = 2;
+    if (unlikely(n_->modstate_ != leaf<P>::modstate_insert)) {
+        masstree_invariant(n_->modstate_ == leaf<P>::modstate_remove);
+        n_->mark_insert();
+        n_->modstate_ = leaf<P>::modstate_insert;
+    }
+
+    if (n_->size() < n_->width) {
+        kx_.p = permuter_type(n_->permutation_).back();
+        if (likely(kx_.p != 0) || !n_->prev_ || n_->ikey_bound() == ka_.ikey()) {
+            n_->assign(kx_.p, ka_, ti);
+        } else {
+            if (make_split(ti)) {
+                n_->unlock();
+                return false;
+            }
+        }
+    } else {
+        if (make_split(ti)) {
+            n_->unlock();
+            return false;
+        }
+    }
+
+    n_->lv_[kx_.p] = layer_root;
+    n_->keylenx_[kx_.p] = n_->layer_keylenx;
+    fence();
+    finish_insert();
+    if (n_ == original_n_)
+        updated_v_ = n_->full_unlocked_version_value();
+    else
+        new_nodes_.emplace_back(n_, n_->full_unlocked_version_value());
+    n_->unlock();
+    return true;
+}
+
+template <typename P>
 bool tcursor<P>::make_new_layer(threadinfo& ti) {
     key_type oka(n_->ksuf(kx_.p));
     ka_.shift();

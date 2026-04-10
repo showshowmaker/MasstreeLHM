@@ -62,18 +62,99 @@ bool tcursor<P>::gc_layer(threadinfo& ti)
         }
 
         internode_type *in = static_cast<internode_type *>(layer);
-        if (in->size() > 0) {
+        // 对带目录语义的 root 来说，删除大量孩子后可能会残留一种
+        // “size()==1、child_[0] 已空、唯一有效子树挂在 child_[1]” 的中间态。
+        // 这里先把 root 归一化成“size()==0、child_[0] 为唯一有效子树”，
+        // 再复用下面已有的 root 收缩与 meta 迁移逻辑。
+        if (in->size() > 1) {
             return false;
         }
         in->lock(*layer, ti.lock_fence(tc_internode_lock));
-        if (!in->is_root() || in->size() > 0) {
+        if (!in->is_root() || in->size() > 1) {
             goto unlock_layer;
         }
 
+        if (in->size() == 1 && in->child_[0] && in->child_[1]) {
+            node_type* left = in->child_[0];
+            if (!left->isleaf()) {
+                goto unlock_layer;
+            }
+
+            leaf_type* left_leaf = static_cast<leaf_type*>(left);
+            left_leaf->lock(*left_leaf, ti.lock_fence(tc_leaf_lock));
+            if (left_leaf->size() == 0 && !left_leaf->prev_ && !left_leaf->next_.ptr) {
+                node_type* only_child = in->child_[1];
+                if (!only_child->try_lock(ti.lock_fence(tc_internode_lock))) {
+                    left_leaf->unlock();
+                    in->unlock();
+                    continue;
+                }
+
+                // child_[0] 没有独立分隔键槽位；把唯一有效子树左移到 child_[0]，
+                // 并把 nkeys_ 归零，就把 root 规整成了现有收缩逻辑可处理的形态。
+                left_leaf->mark_deleted();
+                in->child_[0] = only_child;
+                in->child_[1] = nullptr;
+                in->nkeys_ = 0;
+                only_child->set_parent(in);
+                only_child->unlock();
+                left_leaf->unlock();
+                left_leaf->deallocate_rcu(ti);
+            } else {
+                left_leaf->unlock();
+                goto unlock_layer;
+            }
+        }
+
         node_type *child = in->child_[0];
+        if (!child) {
+            goto unlock_layer;
+        }
         if (!child->try_lock(ti.lock_fence(tc_internode_lock))) {
             in->unlock();
             continue;
+        }
+        if (in->has_directory_meta()) {
+            // 在 LHMFS 语义里，这一层对应真实目录对象。
+            // 当 root internode 已经冗余到只剩唯一 child 时，不能直接把 old root 丢掉，
+            // 而要让真正被提升的新 root 接住目录元数据。
+            if (child->isleaf()) {
+                leaf_type* child_leaf = static_cast<leaf_type*>(child);
+                // 如果 leaf 仍和其他叶子有链表相连，说明它并不是这层唯一叶子，
+                // 不能在这里复制替换。
+                if (child_leaf->prev_ || child_leaf->next_.ptr) {
+                    child->unlock();
+                    in->unlock();
+                    return false;
+                }
+
+                leaf_type* new_root =
+                    leaf_type::clone_root_with_meta(child_leaf, *in->directory_meta(), ti);
+                n_->lv_[kx_.p] = new_root;
+
+                child->unlock();
+                in->mark_split();
+                in->set_parent(new_root);  // 让并发读者从 old root 修正到新 root
+                in->unlock();
+                child_leaf->deallocate_rcu(ti);
+                in->deallocate_rcu(ti);
+                return false;
+            }
+
+            // 唯一 child 仍然是 internode 时，同样采用“复制新 root”的办法：
+            // 新 root 接住目录元数据，旧 root 与旧 child 通过 RCU 延迟回收。
+            internode_type* child_in = static_cast<internode_type*>(child);
+            internode_type* new_root =
+                internode_type::clone_root_with_meta(child_in, *in->directory_meta(), ti);
+            n_->lv_[kx_.p] = new_root;
+
+            child->unlock();
+            in->mark_split();
+            in->set_parent(new_root);  // 让并发读者从 old root 修正到新 root
+            in->unlock();
+            child_in->deallocate_rcu(ti);
+            in->deallocate_rcu(ti);
+            return false;
         }
         child->make_layer_root();
         n_->lv_[kx_.p] = child;
@@ -93,6 +174,13 @@ bool tcursor<P>::gc_layer(threadinfo& ti)
         lf->lock(*lf, ti.lock_fence(tc_leaf_lock));
         if (!lf->is_root() || lf->size() > 0) {
             goto unlock_layer;
+        }
+
+        // 在 LHMFS 语义下，带 directory_meta 的空 leaf root 代表“空目录”，
+        // 而不是 Masstree 里的无意义空技术层，因此这里不能直接回收。
+        if (lf->has_directory_meta()) {
+            lf->unlock();
+            return false;
         }
 
         // child is an empty leaf: kill it
@@ -173,6 +261,17 @@ bool tcursor<P>::finish_remove(threadinfo& ti) {
     } else {
         return remove_leaf(n_, root_, ka_.prefix_string(), ti);
     }
+}
+
+template <typename P>
+bool tcursor<P>::remove_layer_edge(threadinfo& ti) {
+    masstree_precondition(state_ < 0);
+    masstree_precondition(n_->is_layer(kx_.p));
+    bool removed_leaf = finish_remove(ti);
+    if (!removed_leaf) {
+        n_->unlock();
+    }
+    return true;
 }
 
 template <typename P>

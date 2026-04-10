@@ -216,7 +216,13 @@ bool tcursor<P>::make_split(threadinfo& ti)
         }
 
         if (kp < 0 || p->height_ > height + 1) {
-            internode_type *nn = internode_type::make(height + 1, ti);
+            internode_type *nn;
+            if (kp < 0 && n->has_directory_meta()) {
+                nn = internode_type::make_root_with_meta(height + 1,
+                                                         *n->directory_meta(), ti);
+            } else {
+                nn = internode_type::make(height + 1, ti);
+            }
             nn->child_[0] = n;
             nn->assign(0, xikey[sense], child);
             nn->nkeys_ = 1;

@@ -1,0 +1,5 @@
+operation,threads,requested_ops,attempted_ops,success,failure,elapsed_seconds,throughput_ops_per_sec,avg_latency_us,load_limit,loaded_records,skipped_bad_lines,skipped_long_component,skipped_missing_parent,skipped_duplicate,input_path
+stat,1,200,200,200,0,0.002170,92152.649,9.430,2000,2000,0,1338122,85468515,0,"/mnt/batchtest/filepath/path_kv_ideep.txt"
+ls,1,50,50,50,0,0.045048,1109.936,898.072,2000,2000,0,1338122,85468515,0,"/mnt/batchtest/filepath/path_kv_ideep.txt"
+create,1,100,100,100,0,0.001314,76078.952,10.395,2000,2000,0,1338122,85468515,0,"/mnt/batchtest/filepath/path_kv_ideep.txt"
+delete,1,100,100,100,0,0.001209,82705.119,9.605,2000,2000,0,1338122,85468515,0,"/mnt/batchtest/filepath/path_kv_ideep.txt"

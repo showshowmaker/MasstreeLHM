@@ -332,7 +332,7 @@ fi
 AC_ARG_ENABLE([max-key-len],
     [AS_HELP_STRING([--enable-max-key-len=ARG],
                     [maximum length of a key in bytes, default 255])],
-    [ac_cv_max_key_len=$enableval], [ac_cv_max_key_len=255])
+    [ac_cv_max_key_len=$enableval], [ac_cv_max_key_len=1024])
 AC_DEFINE_UNQUOTED([MASSTREE_MAXKEYLEN], [$ac_cv_max_key_len], [Maximum key length])
 
 AC_MSG_CHECKING([whether MADV_HUGEPAGE is supported])
