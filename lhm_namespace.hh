@@ -69,6 +69,11 @@ struct directory_root_debug_info {
     int child1_size;
 };
 
+struct lookup_probe_stats {
+    uint32_t directory_levels_walked = 0;
+    uint32_t child_slot_lookups = 0;
+};
+
 inline std::string entry_name(const namespace_entry& entry) {
     return std::string(entry.name, entry.name + entry.name_length);
 }
@@ -214,6 +219,29 @@ class LhmNamespace {
     // readdir 只扫描“当前目录对应 layer root”这一层的孩子项。
     // 扫描顺序按 Masstree 键序从左到右；命中目录 edge 时只读取目录元数据，
     // 不下钻到子目录内部。
+    bool lookup_inode(const std::string& path, inode_ref& out, threadinfo& ti) const {
+        value_type entry;
+        if (!lookup_entry(path, entry, ti)) {
+            return false;
+        }
+        out = entry.ref;
+        return true;
+    }
+
+    bool lookup_inode_from_parsed(const ParsedPath& parsed, inode_ref& out, threadinfo& ti) const {
+        return lookup_inode_from_parsed(parsed, out, ti, nullptr);
+    }
+
+    bool lookup_inode_from_parsed(const ParsedPath& parsed, inode_ref& out, threadinfo& ti,
+                                  lookup_probe_stats* stats) const {
+        value_type entry;
+        if (!lookup_entry_from_parsed(parsed, entry, ti, stats)) {
+            return false;
+        }
+        out = entry.ref;
+        return true;
+    }
+
     std::vector<readdir_record> readdir(const std::string& path, threadinfo& ti) const {
         ParsedPath parsed = PathKey::parse_absolute_path(path);
         std::vector<readdir_record> results;
@@ -823,6 +851,11 @@ class LhmNamespace {
     }
 
     bool lookup_entry_from_parsed(const ParsedPath& parsed, value_type& out, threadinfo& ti) const {
+        return lookup_entry_from_parsed(parsed, out, ti, nullptr);
+    }
+
+    bool lookup_entry_from_parsed(const ParsedPath& parsed, value_type& out, threadinfo& ti,
+                                  lookup_probe_stats* stats) const {
         if (parsed.normalized_path == "/") {
             out = make_namespace_entry(entry_kind::directory, make_inode_ref(0, 0), "/");
             return true;
@@ -842,14 +875,14 @@ class LhmNamespace {
         parent.hashes.pop_back();
 
         const node_type* parent_root_const = nullptr;
-        if (!locate_directory_root(parent, parent_root_const, ti)) {
+        if (!locate_directory_root(parent, parent_root_const, ti, stats)) {
             return false;
         }
 
         return lookup_child_from_parent_root(const_cast<node_type*>(parent_root_const),
                                              parsed.components.back(),
                                              parsed.hashes.back(),
-                                             out, ti);
+                                             out, ti, stats);
     }
 
     bool create_entry_from_parsed(const ParsedPath& parsed, entry_kind kind, inode_ref ref,
@@ -995,6 +1028,15 @@ class LhmNamespace {
     bool lookup_child_from_parent_root(node_type* parent_root, const std::string& child_name,
                                        uint64_t child_hash, value_type& out,
                                        threadinfo& ti) const {
+        return lookup_child_from_parent_root(parent_root, child_name, child_hash, out, ti, nullptr);
+    }
+
+    bool lookup_child_from_parent_root(node_type* parent_root, const std::string& child_name,
+                                       uint64_t child_hash, value_type& out,
+                                       threadinfo& ti, lookup_probe_stats* stats) const {
+        if (stats != nullptr) {
+            ++stats->child_slot_lookups;
+        }
         child_slot_lookup slot;
         if (!lookup_child_slot_from_parent_root(parent_root, child_hash, slot, ti)) {
             return false;
@@ -1088,6 +1130,11 @@ class LhmNamespace {
 
     bool locate_directory_root(const ParsedPath& parsed, const node_type*& out,
                                threadinfo& ti) const {
+        return locate_directory_root(parsed, out, ti, nullptr);
+    }
+
+    bool locate_directory_root(const ParsedPath& parsed, const node_type*& out,
+                               threadinfo& ti, lookup_probe_stats* stats) const {
         out = table_.root();
         if (parsed.normalized_path == "/") {
             return true;
@@ -1101,6 +1148,9 @@ class LhmNamespace {
             int state = cursor.state();
             if (state >= 0 || !cursor.is_layer()) {
                 return false;
+            }
+            if (stats != nullptr) {
+                ++stats->directory_levels_walked;
             }
             out = canonicalize_directory_root(cursor.layer_root());
         }
